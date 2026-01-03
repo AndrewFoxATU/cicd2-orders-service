@@ -11,8 +11,8 @@ from .models import Base, Sale
 from .schemas import SellCreate, SellRead
 from .main_topic import publish_message
 
-TYRES_SERVICE_URL = os.getenv("TYRES_SERVICE_URL", "http://tyres-service:8000")
-USERS_SERVICE_URL = os.getenv("USERS_SERVICE_URL", "http://users-service:8000")
+TYRES_SERVICE_URL = os.getenv("TYRES_SERVICE_URL", "http://tyres_service:8000")
+USERS_SERVICE_URL = os.getenv("USERS_SERVICE_URL", "http://users_service:8000")
 
 app = FastAPI()
 Base.metadata.create_all(bind=engine)
@@ -30,7 +30,7 @@ async def sell(payload: SellCreate, db: Session = Depends(get_db)):
         # -----------------------
         # get seller info
         # -----------------------
-        u = await client.get(f"{USERS_SERVICE_URL}/users/{payload.seller_user_id}")
+        u = await client.get(f"{USERS_SERVICE_URL}/api/users/{payload.seller_user_id}")
         if u.status_code == 404:
             raise HTTPException(status_code=404, detail="Seller not found")
         if u.status_code >= 400:
