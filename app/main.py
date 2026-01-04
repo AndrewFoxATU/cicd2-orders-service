@@ -21,7 +21,7 @@ Base.metadata.create_all(bind=engine)
 def health():
     return {"status": "ok"}
 
-@app.post("/sell", response_model=SellRead)
+@app.post("/api/sell", response_model=SellRead)
 async def sell(payload: SellCreate, db: Session = Depends(get_db)):
     if payload.quantity <= 0:
         raise HTTPException(status_code=400, detail="Quantity must be > 0")
