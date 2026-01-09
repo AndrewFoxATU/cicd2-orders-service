@@ -9,7 +9,7 @@ POSTGRES_DB = os.getenv("ORDERS_DB_NAME", "orders_db")
 POSTGRES_HOST = os.getenv("ORDERS_DB_HOST", "postgres")
 POSTGRES_PORT = os.getenv("ORDERS_DB_PORT", "5432")
 
-DATABASE_URL = (
+DATABASE_URL = os.getenv("DATABASE_URL") or (
     f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
     f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 )
