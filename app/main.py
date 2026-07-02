@@ -10,6 +10,7 @@ from .database import engine, get_db
 from .models import Base, Sale
 from .schemas import SellCreate, SellRead
 from .main_topic import publish_message
+from .auth import TokenUser, require_roles, service_auth_headers
 
 TYRES_SERVICE_URL = os.getenv("TYRES_SERVICE_URL", "http://tyres_service:8000")
 USERS_SERVICE_URL = os.getenv("USERS_SERVICE_URL", "http://users_service:8000")
@@ -22,15 +23,27 @@ def health():
     return {"status": "ok"}
 
 @app.post("/api/sell", response_model=SellRead)
-async def sell(payload: SellCreate, db: Session = Depends(get_db)):
+async def sell(
+    payload: SellCreate,
+    db: Session = Depends(get_db),
+    current: TokenUser = Depends(require_roles("admin", "employee+", "employee")),
+):
     if payload.quantity <= 0:
         raise HTTPException(status_code=400, detail="Quantity must be > 0")
 
+    # Staff can only record sales as themselves; admins may sell on behalf of others
+    if current.role != "admin" and payload.seller_user_id != current.id:
+        raise HTTPException(status_code=403, detail="Cannot sell as another user")
+
+    headers = service_auth_headers()
     async with httpx.AsyncClient(timeout=8.0) as client:
         # -----------------------
         # get seller info
         # -----------------------
-        u = await client.get(f"{USERS_SERVICE_URL}/api/users/{payload.seller_user_id}")
+        u = await client.get(
+            f"{USERS_SERVICE_URL}/api/users/{payload.seller_user_id}",
+            headers=headers,
+        )
         if u.status_code == 404:
             raise HTTPException(status_code=404, detail="Seller not found")
         if u.status_code >= 400:
@@ -40,7 +53,10 @@ async def sell(payload: SellCreate, db: Session = Depends(get_db)):
         # -----------------------
         # get tyre + check stock
         # -----------------------
-        t = await client.get(f"{TYRES_SERVICE_URL}/api/tyres/{payload.tyre_id}")
+        t = await client.get(
+            f"{TYRES_SERVICE_URL}/api/tyres/{payload.tyre_id}",
+            headers=headers,
+        )
         if t.status_code == 404:
             raise HTTPException(status_code=404, detail="Tyre not found")
         if t.status_code >= 400:
@@ -62,6 +78,7 @@ async def sell(payload: SellCreate, db: Session = Depends(get_db)):
         p = await client.patch(
             f"{TYRES_SERVICE_URL}/api/tyres/{payload.tyre_id}",
             json={"quantity": new_qty},
+            headers=headers,
         )
         if p.status_code >= 400:
             raise HTTPException(status_code=502, detail="Failed to update stock")
