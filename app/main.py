@@ -51,40 +51,28 @@ async def sell(
         seller_name = u.json().get("name")
 
         # -----------------------
-        # get tyre + check stock
+        # reserve stock atomically: the tyres service checks and
+        # decrements in a single statement, so two simultaneous
+        # sales can never both take the last tyres
         # -----------------------
-        t = await client.get(
-            f"{TYRES_SERVICE_URL}/api/tyres/{payload.tyre_id}",
+        d = await client.post(
+            f"{TYRES_SERVICE_URL}/api/tyres/{payload.tyre_id}/stock",
+            json={"delta": -payload.quantity},
             headers=headers,
         )
-        if t.status_code == 404:
+        if d.status_code == 404:
             raise HTTPException(status_code=404, detail="Tyre not found")
-        if t.status_code >= 400:
-            raise HTTPException(status_code=502, detail="Tyres service error")
-
-        tyre = t.json()
-        current_qty = int(tyre["quantity"])
-
-        if current_qty < payload.quantity:
+        if d.status_code == 409:
             raise HTTPException(status_code=409, detail="Not enough stock")
+        if d.status_code >= 400:
+            raise HTTPException(status_code=502, detail="Failed to update stock")
 
+        tyre = d.json()
         unit_price = Decimal(str(tyre["retail_cost"]))
         total_charge = (unit_price * payload.quantity).quantize(Decimal("0.01"))
 
-        # -----------------------
-        # update quantity (sell)
-        # -----------------------
-        new_qty = current_qty - payload.quantity
-        p = await client.patch(
-            f"{TYRES_SERVICE_URL}/api/tyres/{payload.tyre_id}",
-            json={"quantity": new_qty},
-            headers=headers,
-        )
-        if p.status_code >= 400:
-            raise HTTPException(status_code=502, detail="Failed to update stock")
-
     # -----------------------
-    # store sale record
+    # store sale record; if that fails, put the stock back
     # -----------------------
     sale = Sale(
         seller_user_id=payload.seller_user_id,
@@ -92,19 +80,47 @@ async def sell(
         quantity=payload.quantity,
         total_charge=total_charge,
     )
-    db.add(sale)
-    db.commit()
+    try:
+        db.add(sale)
+        db.commit()
+    except Exception:
+        db.rollback()
+        await _restore_stock(payload.tyre_id, payload.quantity)
+        raise HTTPException(
+            status_code=502, detail="Failed to record sale; stock restored"
+        )
     db.refresh(sale)
 
-    await publish_message("sale.created", {
-        "sale_id": sale.id,
-        "seller_user_id": payload.seller_user_id,
-        "seller_name": seller_name,
-        "tyre_id": payload.tyre_id,
-        "quantity": payload.quantity,
-        "total_charge": str(total_charge),
-    })
+    # -----------------------
+    # notify (best effort — a broker outage must not undo a stored sale)
+    # -----------------------
+    try:
+        await publish_message("sale.created", {
+            "sale_id": sale.id,
+            "seller_user_id": payload.seller_user_id,
+            "seller_name": seller_name,
+            "tyre_id": payload.tyre_id,
+            "quantity": payload.quantity,
+            "total_charge": str(total_charge),
+        })
+    except Exception as exc:
+        print(f"[sell] sale {sale.id} stored but event publish failed: {exc}")
 
     result = SellRead.model_validate(sale)
     result.seller_name = seller_name
     return result
+
+
+async def _restore_stock(tyre_id: int, quantity: int) -> None:
+    """Compensate a failed sale by adding the reserved stock back."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(
+                f"{TYRES_SERVICE_URL}/api/tyres/{tyre_id}/stock",
+                json={"delta": quantity},
+                headers=service_auth_headers(),
+            )
+        if r.status_code >= 400:
+            print(f"[sell] MANUAL FIX NEEDED: could not restore {quantity} stock for tyre {tyre_id} (HTTP {r.status_code})")
+    except Exception as exc:
+        print(f"[sell] MANUAL FIX NEEDED: could not restore {quantity} stock for tyre {tyre_id}: {exc}")
