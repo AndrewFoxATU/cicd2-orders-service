@@ -1,3 +1,5 @@
+import sqlalchemy.orm
+
 import app.main as main_mod
 
 class FakeResp:
@@ -13,13 +15,12 @@ class FakeAsyncClient:
     user_status = 200
     user_name = "Alice"
 
-    tyre_status = 200
-    tyre_qty = 10
+    # status returned by the atomic stock endpoint
+    stock_status = 200
+    tyre_qty_after = 7
     tyre_price = "135.00"
 
-    patch_status = 200  # stock update
-
-    seen_headers = []
+    calls = []  # (method, url, json, has_auth)
 
     def __init__(self, timeout=None):
         pass
@@ -31,28 +32,32 @@ class FakeAsyncClient:
         return False
 
     async def get(self, url: str, headers=None):
-        FakeAsyncClient.seen_headers.append(headers)
+        FakeAsyncClient.calls.append(("GET", url, None, bool(headers and headers.get("Authorization"))))
         if "/api/users/" in url:
             if self.user_status == 200:
                 return FakeResp(200, {"id": 1, "name": self.user_name})
             return FakeResp(self.user_status, {})
-
-        if "/api/tyres/" in url:
-            if self.tyre_status == 200:
-                return FakeResp(200, {"id": 10, "quantity": self.tyre_qty, "retail_cost": self.tyre_price})
-            return FakeResp(self.tyre_status, {})
-
         return FakeResp(500, {})
 
-    async def patch(self, url: str, json: dict, headers=None):
-        FakeAsyncClient.seen_headers.append(headers)
-        return FakeResp(self.patch_status, {})
+    async def post(self, url: str, json: dict, headers=None):
+        FakeAsyncClient.calls.append(("POST", url, json, bool(headers and headers.get("Authorization"))))
+        if url.endswith("/stock"):
+            if self.stock_status == 200:
+                return FakeResp(200, {
+                    "id": 10,
+                    "quantity": self.tyre_qty_after,
+                    "retail_cost": self.tyre_price,
+                })
+            return FakeResp(self.stock_status, {})
+        return FakeResp(500, {})
 
 
 
 
 def _use_fakes(monkeypatch):
-    FakeAsyncClient.seen_headers = []
+    FakeAsyncClient.calls = []
+    FakeAsyncClient.user_status = 200
+    FakeAsyncClient.stock_status = 200
     monkeypatch.setattr(main_mod.httpx, "AsyncClient", lambda timeout=8.0: FakeAsyncClient(timeout=timeout))
 
 
@@ -62,12 +67,15 @@ def _use_fakes(monkeypatch):
     monkeypatch.setattr(main_mod, "publish_message", fake_publish_message)
 
 
+def _stock_calls():
+    return [c for c in FakeAsyncClient.calls if c[0] == "POST" and c[1].endswith("/stock")]
+
+
 # Tests
 
 def test_sell_happy_path(client, monkeypatch, seller_headers):
     _use_fakes(monkeypatch)
 
-    # user 200, tyre qty=10, price=135, patch 200
     r = client.post(
         "/api/sell",
         json={"seller_user_id": 1, "tyre_id": 10, "quantity": 3},
@@ -82,10 +90,11 @@ def test_sell_happy_path(client, monkeypatch, seller_headers):
     assert data["quantity"] == 3
     assert str(data["total_charge"]) == "405.00"  # 135.00 * 3
 
-    # every internal call carried a service token
-    assert FakeAsyncClient.seen_headers
-    for headers in FakeAsyncClient.seen_headers:
-        assert headers and headers.get("Authorization", "").startswith("Bearer ")
+    # exactly one atomic decrement, carrying a service token
+    stock = _stock_calls()
+    assert len(stock) == 1
+    assert stock[0][2] == {"delta": -3}
+    assert stock[0][3] is True  # Authorization header present
 
 
 def test_sell_requires_auth(client, monkeypatch):
@@ -98,7 +107,6 @@ def test_sell_requires_auth(client, monkeypatch):
 def test_sell_as_another_user_is_forbidden(client, monkeypatch, other_seller_headers):
     _use_fakes(monkeypatch)
 
-    # token belongs to user 2, payload claims user 1
     r = client.post(
         "/api/sell",
         json={"seller_user_id": 1, "tyre_id": 10, "quantity": 1},
@@ -144,12 +152,26 @@ def test_sell_seller_not_found_returns_404(client, monkeypatch, admin_headers):
     assert r.status_code == 404
     assert r.json()["detail"] == "Seller not found"
 
-    FakeAsyncClient.user_status = 200
+    # stock was never touched
+    assert _stock_calls() == []
+
+
+def test_sell_tyre_not_found_returns_404(client, monkeypatch, seller_headers):
+    _use_fakes(monkeypatch)
+    FakeAsyncClient.stock_status = 404
+
+    r = client.post(
+        "/api/sell",
+        json={"seller_user_id": 1, "tyre_id": 999, "quantity": 1},
+        headers=seller_headers,
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Tyre not found"
 
 
 def test_sell_not_enough_stock_returns_409(client, monkeypatch, seller_headers):
     _use_fakes(monkeypatch)
-    FakeAsyncClient.tyre_qty = 2
+    FakeAsyncClient.stock_status = 409
 
     r = client.post(
         "/api/sell",
@@ -159,13 +181,10 @@ def test_sell_not_enough_stock_returns_409(client, monkeypatch, seller_headers):
     assert r.status_code == 409
     assert r.json()["detail"] == "Not enough stock"
 
-    # reset
-    FakeAsyncClient.tyre_qty = 10
 
-
-def test_sell_patch_failure_returns_502(client, monkeypatch, seller_headers):
+def test_sell_stock_service_error_returns_502(client, monkeypatch, seller_headers):
     _use_fakes(monkeypatch)
-    FakeAsyncClient.patch_status = 500
+    FakeAsyncClient.stock_status = 500
 
     r = client.post(
         "/api/sell",
@@ -175,5 +194,42 @@ def test_sell_patch_failure_returns_502(client, monkeypatch, seller_headers):
     assert r.status_code == 502
     assert r.json()["detail"] == "Failed to update stock"
 
-    # reset
-    FakeAsyncClient.patch_status = 200
+
+def test_sell_restores_stock_when_sale_cannot_be_saved(client, monkeypatch, seller_headers):
+    _use_fakes(monkeypatch)
+
+    def failing_commit(self):
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(sqlalchemy.orm.Session, "commit", failing_commit)
+
+    r = client.post(
+        "/api/sell",
+        json={"seller_user_id": 1, "tyre_id": 10, "quantity": 2},
+        headers=seller_headers,
+    )
+    assert r.status_code == 502
+    assert r.json()["detail"] == "Failed to record sale; stock restored"
+
+    # decrement followed by a compensating restore
+    stock = _stock_calls()
+    assert [c[2] for c in stock] == [{"delta": -2}, {"delta": 2}]
+
+
+def test_sell_succeeds_even_if_event_publish_fails(client, monkeypatch, seller_headers):
+    _use_fakes(monkeypatch)
+
+    async def broken_publish(routing_key: str, payload: dict):
+        raise ConnectionError("broker unreachable")
+
+    monkeypatch.setattr(main_mod, "publish_message", broken_publish)
+
+    r = client.post(
+        "/api/sell",
+        json={"seller_user_id": 1, "tyre_id": 10, "quantity": 1},
+        headers=seller_headers,
+    )
+    assert r.status_code == 200, r.text
+
+    # no compensation happened — the sale stands
+    assert [c[2] for c in _stock_calls()] == [{"delta": -1}]

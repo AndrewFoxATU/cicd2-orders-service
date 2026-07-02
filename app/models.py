@@ -1,6 +1,6 @@
 # orders_service/models.py
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import Integer, Numeric
+from sqlalchemy import CheckConstraint, Integer, Numeric
 from decimal import Decimal
 
 class Base(DeclarativeBase):
@@ -8,6 +8,10 @@ class Base(DeclarativeBase):
 
 class Sale(Base):
     __tablename__ = "sales"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_sales_quantity_positive"),
+        CheckConstraint("total_charge >= 0", name="ck_sales_total_charge_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 

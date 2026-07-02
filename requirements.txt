@@ -35,3 +35,4 @@ typing_extensions==4.15.0
 uvicorn==0.35.0
 aio_pika
 PyJWT==2.10.1
+alembic==1.13.3
